@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# colorfan - custom fan curve for the Colorful X17 Pro (Clevo DCHU EC over ACPI WMI WMBB)
+set -uo pipefail
+
+CONF=${COLORFAN_CONF:-/etc/colorfan.conf}
+[ -r "$CONF" ] && . "$CONF"
+
+ACPI_CALL=${ACPI_CALL:-/proc/acpi/call}
+FAN_METHOD=${FAN_METHOD:-\_SB.WMI.WMBB}
+
+CMD_READ=0x0c         # EC telemetry: RPM + current duty
+CMD_SET_DUTY=0x68     # direct duty, one byte per channel 1-4
+CMD_SET_AUTO=0x69     # per-channel bitmask -> back to EC auto curve
+CMD_SET_MODE=0x79     # global EC fan mode preset
+
+CPU_DUTY=${CPU_DUTY:-1}      # channel index (1-4) wired to the CPU fan
+GPU_DUTY=${GPU_DUTY:-2}
+UNMAPPED_DUTY=${UNMAPPED_DUTY:-}   # empty = mirror the CPU duty; 255 would pin unused channels full
+# telemetry byte offsets, 1-based, inside the 0x0c buffer: hi byte then lo byte
+CPU_RPM_BYTES=${CPU_RPM_BYTES:-"3 4"}
+GPU_RPM_BYTES=${GPU_RPM_BYTES:-"5 6"}
+CPU_DUTY_BYTE=${CPU_DUTY_BYTE:-17}
+GPU_DUTY_BYTE=${GPU_DUTY_BYTE:-20}
+POLL_S=${POLL_S:-2}
+REASSERT_S=${REASSERT_S:-60}
+HOLD_DOWN_S=${HOLD_DOWN_S:-15}
+STEP_MAX=${STEP_MAX:-20}
+EMERG_C=${EMERG_C:-90}
+
+CPU_CURVE=${CPU_CURVE:-'40:30 55:45 62:60 66:80 70:100'}
+GPU_CURVE=${GPU_CURVE:-'40:30 55:45 62:60 66:80 70:100'}
+
+die() { echo "colorfan: $*" >&2; exit 1; }
+need_call() { [ -w "$ACPI_CALL" ] || die "$ACPI_CALL missing - load acpi_call (see README step 1)"; }
+
+# ---- EC access -------------------------------------------------------------
+# acpi_call hands back the EC reply as raw bytes, NULs included. Command
+# substitution drops them ("ignored null byte in input"), so the reply is always
+# captured to a file and parsed from the file.
+REPLY_FILE=${REPLY_FILE:-$(mktemp "${TMPDIR:-/tmp}/colorfan_reply.XXXXXX" 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/colorfan_reply.$$")}
+cleanup_reply() { rm -f "$REPLY_FILE"; }
+trap cleanup_reply EXIT
+
+# call <arg1> <arg2> ; leaves the reply in REPLY_FILE, dies only if the method failed.
+# A void method returns NULL, which is success for the duty/auto/mode writes, so NULL is
+# not treated as an error here; read_telemetry() checks length instead.
+call() {
+  printf '%s 0x0 %s %s\n' "$FAN_METHOD" "$1" "$2" > "$ACPI_CALL" || die "write to $ACPI_CALL failed"
+  cat "$ACPI_CALL" > "$REPLY_FILE" 2>/dev/null || die "read of $ACPI_CALL failed"
+  local head
+  head=$(tr -d '\0' < "$REPLY_FILE" | head -c 80)
+  case "$head" in
+    *AE_*) die "ACPI call $FAN_METHOD $1 $2 -> $head" ;;
+  esac
+}
+
+# reply_bytes -> whitespace separated decimal byte values.
+# acpi_call answers this firmware with comma-separated hex text inside braces and one
+# trailing NUL; a raw-buffer reply is handled by the fallback branch.
+reply_bytes() {
+  local txt
+  txt=$(tr -d '\0{}' < "$REPLY_FILE")
+  case "$txt" in
+    *0x*)
+      printf '%s\n' "$txt" | tr ',' '\n' | sed '/^[[:space:]]*$/d' |
+        while read -r b; do printf '%d ' "$((b))" 2>/dev/null || printf '? '; done ;;
+    *)
+      od -An -v -tu1 "$REPLY_FILE" | tr -s ' \n' ' ' ;;
+  esac
+}
+
+duty_word() { # <ch1> <ch2> <ch3> <ch4> -> 0x%08x, byte0 = channel 1
+  printf '0x%02x%02x%02x%02x' "$4" "$3" "$2" "$1"
+}
+
+auto_all()  { call $CMD_SET_AUTO 0x0000000f >/dev/null; }
+
+# apply_duty <cpu> <gpu>: route each duty to its configured channel. Channels we do
+# not map mirror the CPU duty when UNMAPPED_DUTY is empty; set it to a number to pin them.
+apply_duty() {
+  local unmapped="${UNMAPPED_DUTY:-$1}"
+  local ch=("$unmapped" "$unmapped" "$unmapped" "$unmapped") i
+  for i in 1 2 3 4; do
+    [ "$CPU_DUTY" = "$i" ] && ch[$((i-1))]=$1
+    [ "$GPU_DUTY" = "$i" ] && ch[$((i-1))]=$2
+  done
+  LAST_DUTY_WORD=$(duty_word "${ch[0]}" "${ch[1]}" "${ch[2]}" "${ch[3]}")
+  call $CMD_SET_DUTY "$LAST_DUTY_WORD" >/dev/null
+}
+
+# ---- sensors ---------------------------------------------------------------
+cpu_temp() {
+  local t
+  t=$(sensors -j 2>/dev/null | jq -r '."coretemp-isa-0000"."Package id 0".temp1_input' 2>/dev/null)
+  [ -n "$t" ] && [ "$t" != null ] || { t=$(sensors 2>/dev/null | awk '/^Package id 0/{gsub(/\+/,"");print $4}'); }
+  [ -n "$t" ] && [ "$t" != null ] || die "no coretemp Package id 0 reading"
+  printf '%s\n' "$t"
+}
+
+gpu_temp() {
+  local t
+  t=$(timeout 5 nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | tr -d ' ')
+  [ -n "$t" ] || t=${GPU_TEMP_FALLBACK:-45}
+  printf '%s\n' "$t"
+}
+
+# curve_pct <temp> <curve> -> interpolated percent (0-100), clamped
+curve_pct() {
+  awk -v t="$1" -v c="$2" 'BEGIN{
+    n=split(c,p," "); if(n==0){print 100; exit}
+    split(p[1],a,":"); lo_t=a[1]; lo_p=a[2]
+    split(p[n],z,":"); hi_t=z[1]; hi_p=z[2]
+    if(t<=lo_t){print int(lo_p+0.5); exit}
+    if(t>=hi_t){print int(hi_p+0.5); exit}
+    for(i=1;i<n;i++){split(p[i],u,":");split(p[i+1],v,":")
+      if(t>=u[1] && t<=v[1]){d=(v[2]-u[2])*(t-u[1])/(v[1]-u[1]); print int(u[2]+d+0.5); exit}}
+  }'
+}
+
+pct2duty() { printf '%d' "$(awk -v p="$1" 'BEGIN{printf "%d", p*255/100}')"; }
+
+rpm() { # <hi> <lo> raw byte fields -> displayed RPM (formula from upstream clevo-thermald notes)
+  # hi*256+lo, not (hi<<8)|lo: this box's awk rejects bit-shift operators
+  awk -v hi="$1" -v lo="$2" 'BEGIN{raw=hi*256+lo; if(raw<=0){print "-"; exit}
+    printf "%d", (60/(0.00005565217391304348*raw))*2}'
+}
+
+# read_telemetry fills the global TEL array with the 0x0c buffer as decimal bytes
+read_telemetry() {
+  call $CMD_READ 0x0
+  TEL=()
+  local b
+  for b in $(reply_bytes); do TEL+=("$b"); done
+  # a void method answers NULL and a wrong FAN_METHOD spelling can answer nothing at
+  # all, so require enough bytes to hold the tach/duty fields before trusting them
+  [ "${#TEL[@]}" -ge "$((GPU_DUTY_BYTE + 1))" ] || \
+    die "telemetry reply had ${#TEL[@]} bytes, need $((GPU_DUTY_BYTE + 1)) - check FAN_METHOD"
+}
+getb() { printf '%s' "${TEL[$(($1-1))]:-?}"; }   # 1-indexed byte access
+rpm_at() { # <hi byte> <lo byte> -> RPM, or ? when the buffer is shorter than expected
+  local h l; h=$(getb "$1"); l=$(getb "$2")
+  case "$h $l" in *'?'*) printf '?'; return ;; esac
+  rpm "$h" "$l"
+}
+
+# ---- commands --------------------------------------------------------------
+cmd_status() {
+  need_call
+  read_telemetry
+  local cb=($CPU_RPM_BYTES) gb=($GPU_RPM_BYTES)
+  printf 'cpu temp %s C   gpu temp %s C\n' "$(cpu_temp)" "$(gpu_temp)"
+  printf 'cpu fan  %s rpm (buffer bytes %s/%s)\n' "$(rpm_at "${cb[0]}" "${cb[1]}")" "${cb[0]}" "${cb[1]}"
+  printf 'gpu fan  %s rpm (buffer bytes %s/%s)\n' "$(rpm_at "${gb[0]}" "${gb[1]}")" "${gb[0]}" "${gb[1]}"
+  printf 'reported duty  cpu byte %s = %s   gpu byte %s = %s   (0-255 scale)\n' \
+    "$CPU_DUTY_BYTE" "$(getb "$CPU_DUTY_BYTE")" "$GPU_DUTY_BYTE" "$(getb "$GPU_DUTY_BYTE")"
+  printf 'raw bytes 1-24: %s\n' "${TEL[*]:0:24}"
+}
+
+cmd_probe() {
+  need_call
+  call $CMD_READ 0x0
+  set -- $(reply_bytes)
+  printf 'method %s   reply %s bytes\n' "$FAN_METHOD" "$(wc -c < "$REPLY_FILE")"
+  printf 'decimal bytes 1-24: %s\n' "${*:1:24}"
+  printf 'hex dump head:\n'; od -An -tx1 -N32 "$REPLY_FILE"
+}
+
+cmd_set() { # <percent> [gpu-percent]
+  need_call
+  local c g; c=$(pct2duty "${1:-100}"); g=$(pct2duty "${2:-$1}")
+  apply_duty "$c" "$g"
+  echo "manual duty applied: cpu=$c gpu=$g on channels $CPU_DUTY/$GPU_DUTY (word $LAST_DUTY_WORD)"
+}
+
+cmd_auto() { need_call; auto_all; echo "channels 1-4 handed back to the EC auto curve"; }
+
+cmd_mode() { # auto|max
+  need_call
+  case "${1:-auto}" in
+    auto) call $CMD_SET_MODE 0x01000000 >/dev/null; echo "EC fan mode = auto" ;;
+    max)  call $CMD_SET_MODE 0x01000001 >/dev/null; echo "EC fan mode = max"  ;;
+    *) die "mode is auto|max (silent/maxq values are not documented for this EC)" ;;
+  esac
+}
+
+cmd_calibrate() {
+  need_call
+  local p d cb=($CPU_RPM_BYTES) gb=($GPU_RPM_BYTES)
+  printf 'duty%%  cpu rpm  gpu rpm   (Ctrl-C restores EC auto)\n'
+  trap 'auto_all; cleanup_reply; exit 0' INT TERM EXIT
+  for p in 0 25 50 75 100; do
+    d=$(pct2duty "$p")
+    apply_duty "$d" "$d"
+    sleep 3
+    read_telemetry
+    printf '%4d%%  %8s  %8s   raw1-6: %s\n' "$p" \
+      "$(rpm_at "${cb[0]}" "${cb[1]}")" "$(rpm_at "${gb[0]}" "${gb[1]}")" "${TEL[*]:0:6}"
+  done
+}
+
+cmd_daemon() {
+  need_call
+  printf 'colorfan daemon: 100%% duty at %s C (cpu curve: %s)\n' \
+    "$(printf '%s' "$CPU_CURVE" | awk '{print $NF}' | cut -d: -f1)" "$CPU_CURVE"
+  trap 'auto_all 2>/dev/null; cleanup_reply; exit 0' EXIT INT TERM
+  local cur_c=-1 cur_g=-1 last_rise=0 last_write=0 now t gt pc pg dc dg emerg slew
+  while :; do
+    t=$(cpu_temp) || die "temp read failed"
+    gt=$(gpu_temp)
+    now=$(date +%s)
+    dc=$(pct2duty "$(curve_pct "$t" "$CPU_CURVE")")
+    dg=$(pct2duty "$(curve_pct "$gt" "$GPU_CURVE")")
+
+    # emergency: pin full duty and bypass the slew clamp, both directions
+    emerg=0
+    awk -v t="$t" -v e="$EMERG_C" 'BEGIN{exit !(t>=e)}' && { emerg=1; dc=255; dg=255; }
+    slew=$STEP_MAX; [ "$emerg" = 1 ] && slew=255
+
+    # ramp up at most STEP_MAX per cycle; after a rise hold duty for HOLD_DOWN_S
+    if [ "$dc" -gt "$cur_c" ] && [ "$cur_c" -ge 0 ]; then
+      [ $((dc - cur_c)) -gt "$slew" ] && dc=$((cur_c + slew))
+      last_rise=$now
+    elif [ "$dc" -lt "$cur_c" ] && [ $((now - last_rise)) -lt "$HOLD_DOWN_S" ] && [ "$emerg" = 0 ]; then
+      dc=$cur_c
+    fi
+
+    if [ "$dc" != "$cur_c" ] || [ "$dg" != "$cur_g" ] || [ $((now - last_write)) -ge "$REASSERT_S" ]; then
+      if ! apply_duty "$dc" "$dg"; then
+        auto_all 2>/dev/null
+        die "duty write failed - handed fans back to the EC"
+      fi
+      cur_c=$dc; cur_g=$dg; last_write=$now
+      logger -t colorfan "pkg ${t}C gpu ${gt}C duty cpu ${dc}/255 gpu ${dg}/255" 2>/dev/null
+    fi
+    sleep "$POLL_S"
+  done
+}
+
+case "${1:-help}" in
+  status) cmd_status ;; probe) cmd_probe ;; set) shift; cmd_set "$@" ;;
+  auto) cmd_auto ;; mode) shift; cmd_mode "$@" ;; calibrate) cmd_calibrate ;;
+  daemon) cmd_daemon ;;
+  *) cat <<EOF
+usage: colorfan status | probe | set <cpu%> [gpu%] | auto | mode <auto|max> | calibrate | daemon
+  daemon is started by systemd (see colorfan.service); 'auto' hands the fans back to the EC.
+EOF
+  ;;
+esac
